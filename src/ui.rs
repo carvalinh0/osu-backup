@@ -1,4 +1,4 @@
-//! Ícone na bandeja + loop de eventos. Thread de fundo observa o osu! e dispara o backup.
+//! Tray icon + event loop. A background thread watches osu! and triggers the backup.
 
 use std::net::TcpListener;
 use std::sync::Arc;
@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use anyhow::{Context, Result};
 use tao::event::{Event, StartCause};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
@@ -17,7 +18,7 @@ use crate::sync;
 use crate::watcher::{self, Event as WatchEvent, Phase};
 
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
-/// Espera o osu! terminar de gravar o realm antes de copiar.
+/// Waits for osu! to finish writing the realm before copying it.
 const SETTLE_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
@@ -38,7 +39,7 @@ const ID_QUIT: &str = "quit";
 pub fn run(_instance_lock: TcpListener) -> ! {
     #[cfg(target_os = "linux")]
     if let Err(e) = gtk::init() {
-        tracing::error!("não consegui iniciar o GTK (necessário para a bandeja): {e}");
+        tracing::error!("could not initialize GTK (required for the tray): {e}");
         std::process::exit(1);
     }
 
@@ -54,16 +55,16 @@ pub fn run(_instance_lock: TcpListener) -> ! {
 
     spawn_watcher(proxy.clone());
 
-    let status_item = MenuItem::new("Iniciando…", false, None);
+    let status_item = MenuItem::new("Starting…", false, None);
     let menu = Menu::new();
     let _ = menu.append_items(&[
         &status_item,
         &PredefinedMenuItem::separator(),
-        &MenuItem::with_id(ID_BACKUP, "Fazer backup agora", true, None),
-        &MenuItem::with_id(ID_PICK, "Escolher pasta do osu!", true, None),
-        &MenuItem::with_id(ID_LOGIN, "Reconectar ao Google", true, None),
+        &MenuItem::with_id(ID_BACKUP, "Back up now", true, None),
+        &MenuItem::with_id(ID_PICK, "Choose osu! folder", true, None),
+        &MenuItem::with_id(ID_LOGIN, "Reconnect to Google", true, None),
         &PredefinedMenuItem::separator(),
-        &MenuItem::with_id(ID_QUIT, "Sair", true, None),
+        &MenuItem::with_id(ID_QUIT, "Quit", true, None),
     ]);
 
     let busy = Arc::new(AtomicBool::new(false));
@@ -77,55 +78,22 @@ pub fn run(_instance_lock: TcpListener) -> ! {
         *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(200));
 
         match event {
-            Event::NewEvents(StartCause::Init) => {
-                match TrayIconBuilder::new()
-                    .with_menu(Box::new(menu.clone()))
-                    .with_tooltip("osu!backup")
-                    .with_icon(make_icon())
-                    .build()
-                {
-                    Ok(t) => tray = Some(t),
-                    Err(e) => {
-                        tracing::error!("erro criando ícone da bandeja: {e}");
-                        *control_flow = ControlFlow::Exit;
-                    }
+            Event::NewEvents(StartCause::Init) => match build_tray(&menu) {
+                Ok(t) => tray = Some(t),
+                Err(e) => {
+                    tracing::error!("error creating tray icon: {e:#}");
+                    *control_flow = ControlFlow::Exit;
+                }
+            },
+
+            Event::UserEvent(ue) => {
+                if handle_user_event(ue, &status_item, tray.as_ref(), &proxy, &busy) {
+                    *control_flow = ControlFlow::Exit;
                 }
             }
 
-            Event::UserEvent(ue) => match ue {
-                UserEvent::Status(text) => {
-                    status_item.set_text(&text);
-                    if let Some(t) = &tray {
-                        let _ = t.set_tooltip(Some(format!("osu!backup — {text}")));
-                    }
-                }
-                UserEvent::Toast(text) => {
-                    let _ = notify_rust::Notification::new()
-                        .appname("osu!backup")
-                        .summary("osu!backup")
-                        .body(&text)
-                        .show();
-                }
-                UserEvent::OsuStarted => {}
-                UserEvent::OsuClosed => {
-                    start_backup(&proxy, &busy, true);
-                }
-                UserEvent::JobFinished { quit } => {
-                    if quit {
-                        *control_flow = ControlFlow::Exit;
-                    }
-                }
-                UserEvent::Menu(id) => match id.as_ref() {
-                    ID_BACKUP => start_backup(&proxy, &busy, false),
-                    ID_PICK => start_pick_folder(&proxy, &busy),
-                    ID_LOGIN => start_setup(&proxy, &busy, true),
-                    ID_QUIT => *control_flow = ControlFlow::Exit,
-                    _ => {}
-                },
-            },
-
             Event::MainEventsCleared => {
-                // O tray no Linux usa GTK: é preciso bombear o loop do GTK.
+                // The Linux tray uses GTK, so the GTK loop has to be pumped.
                 #[cfg(target_os = "linux")]
                 while gtk::events_pending() {
                     gtk::main_iteration_do(false);
@@ -137,11 +105,62 @@ pub fn run(_instance_lock: TcpListener) -> ! {
     })
 }
 
-/// Observa o processo do osu! e envia eventos ao loop principal.
+fn build_tray(menu: &Menu) -> Result<TrayIcon> {
+    TrayIconBuilder::new()
+        .with_menu(Box::new(menu.clone()))
+        .with_tooltip("osu!backup")
+        .with_icon(make_icon()?)
+        .build()
+        .context("building tray icon")
+}
+
+/// Handles one app event. Returns true when the app should exit.
+fn handle_user_event(
+    event: UserEvent,
+    status_item: &MenuItem,
+    tray: Option<&TrayIcon>,
+    proxy: &EventLoopProxy<UserEvent>,
+    busy: &Arc<AtomicBool>,
+) -> bool {
+    match event {
+        UserEvent::Status(text) => {
+            status_item.set_text(&text);
+            if let Some(t) = tray {
+                let _ = t.set_tooltip(Some(format!("osu!backup — {text}")));
+            }
+        }
+        UserEvent::Toast(text) => {
+            let _ = notify_rust::Notification::new()
+                .appname("osu!backup")
+                .summary("osu!backup")
+                .body(&text)
+                .show();
+        }
+        UserEvent::OsuStarted => {}
+        UserEvent::OsuClosed => start_backup(proxy, busy, true),
+        UserEvent::JobFinished { quit } => return quit,
+        UserEvent::Menu(id) => return handle_menu(id.as_ref(), proxy, busy),
+    }
+    false
+}
+
+/// Runs the action for a tray menu item. Returns true when the app should exit.
+fn handle_menu(id: &str, proxy: &EventLoopProxy<UserEvent>, busy: &Arc<AtomicBool>) -> bool {
+    match id {
+        ID_BACKUP => start_backup(proxy, busy, false),
+        ID_PICK => start_pick_folder(proxy, busy),
+        ID_LOGIN => start_setup(proxy, busy, true),
+        ID_QUIT => return true,
+        _ => {}
+    }
+    false
+}
+
+/// Watches the osu! process and sends events to the main loop.
 fn spawn_watcher(proxy: EventLoopProxy<UserEvent>) {
     thread::spawn(move || {
         let Ok(mut sys) = sysinfo::System::new() else {
-            tracing::error!("não consegui inicializar a leitura de processos");
+            tracing::error!("could not initialize process monitoring");
             return;
         };
         let mut phase = Phase::Waiting;
@@ -152,7 +171,7 @@ fn spawn_watcher(proxy: EventLoopProxy<UserEvent>) {
             match event {
                 WatchEvent::Started => {
                     let _ = proxy.send_event(UserEvent::OsuStarted);
-                    let _ = proxy.send_event(UserEvent::Status("osu! aberto".into()));
+                    let _ = proxy.send_event(UserEvent::Status("osu! is running".into()));
                 }
                 WatchEvent::Closed => {
                     let _ = proxy.send_event(UserEvent::OsuClosed);
@@ -164,7 +183,7 @@ fn spawn_watcher(proxy: EventLoopProxy<UserEvent>) {
     });
 }
 
-/// Tenta marcar a aplicação como ocupada. Retorna false se já houver um job rodando.
+/// Tries to mark the app as busy. Returns false if a job is already running.
 fn acquire(busy: &Arc<AtomicBool>, proxy: &EventLoopProxy<UserEvent>) -> bool {
     if busy
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -172,7 +191,7 @@ fn acquire(busy: &Arc<AtomicBool>, proxy: &EventLoopProxy<UserEvent>) -> bool {
     {
         true
     } else {
-        let _ = proxy.send_event(UserEvent::Status("Aguarde a tarefa atual".into()));
+        let _ = proxy.send_event(UserEvent::Status("Wait for the current task".into()));
         false
     }
 }
@@ -187,21 +206,21 @@ fn start_backup(proxy: &EventLoopProxy<UserEvent>, busy: &Arc<AtomicBool>, after
         let mut quit = false;
         let cfg = Config::load().unwrap_or_default();
         if !config::is_setup_complete(&cfg) {
-            let _ = proxy.send_event(UserEvent::Status("Configuração pendente".into()));
+            let _ = proxy.send_event(UserEvent::Status("Setup pending".into()));
             let _ = proxy.send_event(UserEvent::Toast(
-                "Configure o app (credenciais, login e pasta) antes do primeiro backup.".into(),
+                "Set up the app (credentials, sign-in and folder) before the first backup.".into(),
             ));
         } else {
             if after_close {
                 thread::sleep(SETTLE_DELAY);
             }
-            let _ = proxy.send_event(UserEvent::Status("Fazendo backup…".into()));
+            let _ = proxy.send_event(UserEvent::Status("Backing up…".into()));
             match sync::run(&cfg) {
                 Ok(r) => {
                     let msg = if r.uploaded == 0 {
-                        "Backup em dia — nada novo".to_string()
+                        "Backup up to date — nothing new".to_string()
                     } else {
-                        format!("Backup concluído: {} arquivo(s) enviado(s)", r.uploaded)
+                        format!("Backup complete: {} file(s) uploaded", r.uploaded)
                     };
                     tracing::info!("{msg}");
                     let _ = proxy.send_event(UserEvent::Status(msg.clone()));
@@ -209,9 +228,9 @@ fn start_backup(proxy: &EventLoopProxy<UserEvent>, busy: &Arc<AtomicBool>, after
                     quit = after_close;
                 }
                 Err(e) => {
-                    tracing::error!("falha no backup: {e:#}");
-                    let _ = proxy.send_event(UserEvent::Status("Falha no backup".into()));
-                    let _ = proxy.send_event(UserEvent::Toast(format!("Falha no backup: {e:#}")));
+                    tracing::error!("backup failed: {e:#}");
+                    let _ = proxy.send_event(UserEvent::Status("Backup failed".into()));
+                    let _ = proxy.send_event(UserEvent::Toast(format!("Backup failed: {e:#}")));
                 }
             }
         }
@@ -230,13 +249,13 @@ fn start_setup(proxy: &EventLoopProxy<UserEvent>, busy: &Arc<AtomicBool>, force_
         let notify = setup::status_notifier(proxy.clone());
         match setup::run(force_login, &notify) {
             Ok(()) => {
-                let _ = proxy.send_event(UserEvent::Status("Configurado — pronto".into()));
-                let _ = proxy.send_event(UserEvent::Toast("Configuração concluída.".into()));
+                let _ = proxy.send_event(UserEvent::Status("Set up — ready".into()));
+                let _ = proxy.send_event(UserEvent::Toast("Setup complete.".into()));
             }
             Err(e) => {
-                tracing::error!("configuração falhou: {e:#}");
-                let _ = proxy.send_event(UserEvent::Status("Configuração incompleta".into()));
-                let _ = proxy.send_event(UserEvent::Toast(format!("Configuração falhou: {e:#}")));
+                tracing::error!("setup failed: {e:#}");
+                let _ = proxy.send_event(UserEvent::Status("Setup incomplete".into()));
+                let _ = proxy.send_event(UserEvent::Toast(format!("Setup failed: {e:#}")));
             }
         }
         busy.store(false, Ordering::SeqCst);
@@ -253,7 +272,7 @@ fn start_pick_folder(proxy: &EventLoopProxy<UserEvent>, busy: &Arc<AtomicBool>) 
     thread::spawn(move || {
         let mut cfg = Config::load().unwrap_or_default();
         let start = cfg.osu_dir_or_default();
-        let mut dialog = rfd::FileDialog::new().set_title("Pasta de dados do osu!lazer");
+        let mut dialog = rfd::FileDialog::new().set_title("osu!lazer data folder");
         if let Some(p) = start {
             dialog = dialog.set_directory(p);
         }
@@ -261,12 +280,12 @@ fn start_pick_folder(proxy: &EventLoopProxy<UserEvent>, busy: &Arc<AtomicBool>) 
             cfg.osu_dir = Some(picked.clone());
             match cfg.save() {
                 Ok(()) => {
-                    let _ =
-                        proxy.send_event(UserEvent::Status(format!("Pasta: {}", picked.display())));
+                    let _ = proxy
+                        .send_event(UserEvent::Status(format!("Folder: {}", picked.display())));
                 }
                 Err(e) => {
                     let _ =
-                        proxy.send_event(UserEvent::Toast(format!("Erro salvando config: {e:#}")));
+                        proxy.send_event(UserEvent::Toast(format!("Error saving config: {e:#}")));
                 }
             }
         }
@@ -275,8 +294,8 @@ fn start_pick_folder(proxy: &EventLoopProxy<UserEvent>, busy: &Arc<AtomicBool>) 
     });
 }
 
-/// Ícone simples gerado em código (círculo rosa), para não depender de arquivos externos.
-fn make_icon() -> Icon {
+/// Simple icon generated in code (pink circle), so no external files are needed.
+fn make_icon() -> Result<Icon> {
     let size: u32 = 32;
     let mut rgba = Vec::with_capacity((size * size * 4) as usize);
     let c = (size as f32 - 1.0) / 2.0;
@@ -290,5 +309,5 @@ fn make_icon() -> Icon {
             }
         }
     }
-    Icon::from_rgba(rgba, size, size).expect("ícone inválido")
+    Icon::from_rgba(rgba, size, size).context("generating tray icon")
 }

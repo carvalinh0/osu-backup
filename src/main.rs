@@ -1,5 +1,5 @@
-//! osu!backup — backup do osu!lazer para o Google Drive.
-//! Fica na bandeja, detecta quando o osu! fecha e envia as mudanças.
+//! osu!backup — backs up osu!lazer to Google Drive.
+//! Lives in the tray, detects when osu! closes and uploads the changes.
 
 #![cfg_attr(
     all(target_os = "windows", not(debug_assertions)),
@@ -19,7 +19,7 @@ use std::net::TcpListener;
 
 use anyhow::Result;
 
-/// Porta usada apenas como trava de instância única (só existe enquanto o app roda).
+/// Port used only as a single-instance lock (held only while the app runs).
 const INSTANCE_LOCK_PORT: u16 = 47319;
 
 fn main() -> Result<()> {
@@ -33,7 +33,7 @@ fn main() -> Result<()> {
     let lock = match TcpListener::bind(("127.0.0.1", INSTANCE_LOCK_PORT)) {
         Ok(l) => l,
         Err(_) => {
-            tracing::warn!("osu!backup já está em execução");
+            tracing::warn!("osu!backup is already running");
             return Ok(());
         }
     };

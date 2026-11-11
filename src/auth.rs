@@ -1,5 +1,5 @@
-//! Login no Google com OAuth2 (app desktop, PKCE + redirect loopback).
-//! Usa o escopo `drive.file`: o app só enxerga arquivos que ele mesmo criou.
+//! Google sign-in with OAuth2 (desktop app, PKCE + loopback redirect).
+//! Uses the `drive.file` scope: the app can only see files it created itself.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
@@ -19,7 +19,7 @@ use crate::config;
 pub const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Conteúdo do client_secret.json baixado do Google Cloud (tipo "Desktop app").
+/// Contents of the client_secret.json downloaded from Google Cloud ("Desktop app" type).
 #[derive(Debug, Deserialize)]
 pub struct ClientSecretFile {
     installed: Option<OAuthApp>,
@@ -37,12 +37,12 @@ pub struct OAuthApp {
 impl ClientSecretFile {
     pub fn load(path: &Path) -> Result<OAuthApp> {
         let text =
-            std::fs::read_to_string(path).with_context(|| format!("lendo {}", path.display()))?;
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         let file: ClientSecretFile =
-            serde_json::from_str(&text).context("client_secret.json inválido")?;
+            serde_json::from_str(&text).context("invalid client_secret.json")?;
         file.installed
             .or(file.web)
-            .context("client_secret.json não contém 'installed' (use o tipo Desktop app)")
+            .context("client_secret.json has no 'installed' entry (use the Desktop app type)")
     }
 }
 
@@ -59,7 +59,7 @@ fn save_refresh_token(token: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&path, token)?;
+    std::fs::write(&path, token).with_context(|| format!("writing {}", path.display()))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -71,7 +71,7 @@ fn save_refresh_token(token: &str) -> Result<()> {
 fn load_refresh_token() -> Result<String> {
     let path = refresh_token_path()?;
     Ok(std::fs::read_to_string(&path)
-        .with_context(|| format!("lendo {}", path.display()))?
+        .with_context(|| format!("reading {}", path.display()))?
         .trim()
         .to_string())
 }
@@ -99,9 +99,9 @@ fn build_client(
         .set_token_uri(TokenUrl::new(app.token_uri.clone())?))
 }
 
-/// Faz o login interativo no navegador e guarda o refresh token.
+/// Runs the interactive sign-in in the browser and stores the refresh token.
 pub fn login(app: &OAuthApp) -> Result<()> {
-    let listener = TcpListener::bind("127.0.0.1:0").context("abrindo porta local")?;
+    let listener = TcpListener::bind("127.0.0.1:0").context("opening local port")?;
     let port = listener.local_addr()?.port();
     let redirect = format!("http://127.0.0.1:{port}");
 
@@ -115,9 +115,9 @@ pub fn login(app: &OAuthApp) -> Result<()> {
         .set_pkce_challenge(challenge)
         .url();
 
-    tracing::info!("abrindo o navegador para login no Google");
+    tracing::info!("opening the browser for Google sign-in");
     if open::that(url.as_str()).is_err() {
-        tracing::warn!("não consegui abrir o navegador; acesse: {url}");
+        tracing::warn!("could not open the browser; visit: {url}");
     }
 
     let code = wait_for_code(&listener, csrf.secret())?;
@@ -125,28 +125,28 @@ pub fn login(app: &OAuthApp) -> Result<()> {
         .exchange_code(AuthorizationCode::new(code))
         .set_pkce_verifier(verifier)
         .request(&http_client()?)
-        .map_err(|e| anyhow!("trocando código por token: {e:?}"))?;
+        .map_err(|e| anyhow!("exchanging code for token: {e:?}"))?;
 
     let refresh = token
         .refresh_token()
-        .context("Google não devolveu refresh_token; revogue o acesso do app e tente de novo")?;
+        .context("Google returned no refresh_token; revoke the app's access and try again")?;
     save_refresh_token(refresh.secret())?;
     Ok(())
 }
 
-/// Espera o redirect do Google na porta loopback e extrai o `code`.
+/// Waits for Google's redirect on the loopback port and extracts the `code`.
 fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String> {
     listener.set_nonblocking(false)?;
     let deadline = std::time::Instant::now() + LOGIN_TIMEOUT;
     loop {
         if std::time::Instant::now() > deadline {
-            bail!("tempo esgotado esperando o login no navegador");
+            bail!("timed out waiting for the browser sign-in");
         }
         let (mut stream, _) = listener.accept()?;
         let mut line = String::new();
         BufReader::new(&stream).read_line(&mut line)?;
 
-        // Ex.: "GET /?state=...&code=... HTTP/1.1"
+        // E.g. "GET /?state=...&code=... HTTP/1.1"
         let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
         let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
         let params: Vec<(&str, &str)> = query
@@ -161,25 +161,25 @@ fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String>
                 .map(|(_, v)| v.to_string())
         };
 
-        // Ignora requisições que não são o redirect (ex.: favicon).
+        // Ignore requests that are not the redirect (e.g. favicon).
         if get("code").is_none() && get("error").is_none() {
-            let _ = respond(&mut stream, "osu!backup: aguardando login.");
+            let _ = respond(&mut stream, "osu!backup: waiting for sign-in.");
             continue;
         }
 
         if let Some(err) = get("error") {
-            let _ = respond(&mut stream, "Login cancelado. Pode fechar esta aba.");
-            bail!("login recusado: {err}");
+            let _ = respond(&mut stream, "Sign-in cancelled. You can close this tab.");
+            bail!("sign-in denied: {err}");
         }
         if get("state").as_deref() != Some(expected_state) {
-            let _ = respond(&mut stream, "Estado inválido. Tente novamente.");
-            bail!("parâmetro state inválido no retorno do Google");
+            let _ = respond(&mut stream, "Invalid state. Please try again.");
+            bail!("invalid state parameter in Google's response");
         }
         let _ = respond(
             &mut stream,
-            "Login concluído. Pode fechar esta aba e voltar ao app.",
+            "Signed in. You can close this tab and return to the app.",
         );
-        return get("code").context("código ausente");
+        return get("code").context("missing code");
     }
 }
 
@@ -195,13 +195,13 @@ fn respond(stream: &mut impl Write, body: &str) -> std::io::Result<()> {
     )
 }
 
-/// Gera um access token novo a partir do refresh token salvo.
+/// Gets a new access token from the stored refresh token.
 pub fn access_token(app: &OAuthApp) -> Result<String> {
     let refresh = load_refresh_token()?;
     let client = build_client(app)?;
     let token = client
         .exchange_refresh_token(&RefreshToken::new(refresh))
         .request(&http_client()?)
-        .map_err(|e| anyhow!("renovando token do Google: {e:?}"))?;
+        .map_err(|e| anyhow!("refreshing Google token: {e:?}"))?;
     Ok(token.access_token().secret().to_string())
 }

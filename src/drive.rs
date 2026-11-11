@@ -1,4 +1,4 @@
-//! Cliente mínimo da API do Google Drive v3 (somente o necessário para o backup).
+//! Minimal Google Drive v3 API client (only what the backup needs).
 
 use std::collections::HashMap;
 
@@ -53,10 +53,10 @@ impl Drive {
             return Ok(resp);
         }
         let body = resp.text().unwrap_or_default();
-        bail!("Google Drive respondeu {status}: {body}");
+        bail!("Google Drive responded {status}: {body}");
     }
 
-    /// Acha a pasta de backup na raiz do Drive ou cria se não existir. Retorna o ID.
+    /// Finds the backup folder at the Drive root, or creates it if missing. Returns its ID.
     pub fn find_or_create_folder(&self) -> Result<String> {
         let q = format!(
             "name = '{DRIVE_FOLDER_NAME}' and mimeType = '{FOLDER_MIME}' and 'root' in parents and trashed = false"
@@ -108,7 +108,7 @@ impl Drive {
         Ok(all)
     }
 
-    /// Mapeia nome -> md5 de todos os arquivos dentro da pasta de backup.
+    /// Maps name -> (id, md5) for every file in the backup folder.
     pub fn folder_index(
         &self,
         folder_id: &str,
@@ -121,8 +121,8 @@ impl Drive {
             .collect())
     }
 
-    /// Envia (cria ou substitui) um arquivo dentro da pasta de backup.
-    /// `existing_id` é o ID do arquivo já existente no Drive, se houver.
+    /// Uploads (creates or replaces) a file in the backup folder.
+    /// `existing_id` is the ID of the file already in Drive, if any.
     pub fn upload(
         &self,
         folder_id: &str,
@@ -162,8 +162,8 @@ impl Drive {
             )
             .body(body)
             .send()
-            .with_context(|| format!("enviando {name}"))?;
-        Self::check(resp).with_context(|| format!("enviando {name}"))?;
+            .with_context(|| format!("uploading {name}"))?;
+        Self::check(resp).with_context(|| format!("uploading {name}"))?;
         Ok(())
     }
 }
