@@ -1,10 +1,11 @@
 //! Google sign-in with OAuth2 (desktop app, PKCE + loopback redirect).
 //! Uses the `drive.file` scope: the app can only see files it created itself.
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
+use std::io::{BufRead, BufReader, ErrorKind, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
 use oauth2::basic::BasicClient;
@@ -18,6 +19,8 @@ use crate::config;
 
 pub const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(300);
+const ACCEPT_POLL: Duration = Duration::from_millis(100);
+const TIMEOUT_MESSAGE: &str = "timed out waiting for the browser sign-in";
 
 /// Contents of the client_secret.json downloaded from Google Cloud ("Desktop app" type).
 #[derive(Debug, Deserialize)]
@@ -120,7 +123,7 @@ pub fn login(app: &OAuthApp) -> Result<()> {
         tracing::warn!("could not open the browser; visit: {url}");
     }
 
-    let code = wait_for_code(&listener, csrf.secret())?;
+    let code = wait_for_code(&listener, csrf.secret(), LOGIN_TIMEOUT)?;
     let token = client
         .exchange_code(AuthorizationCode::new(code))
         .set_pkce_verifier(verifier)
@@ -135,16 +138,17 @@ pub fn login(app: &OAuthApp) -> Result<()> {
 }
 
 /// Waits for Google's redirect on the loopback port and extracts the `code`.
-fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String> {
-    listener.set_nonblocking(false)?;
-    let deadline = std::time::Instant::now() + LOGIN_TIMEOUT;
+/// Gives up after `timeout`, so a sign-in the user abandons does not leave setup busy forever.
+fn wait_for_code(
+    listener: &TcpListener,
+    expected_state: &str,
+    timeout: Duration,
+) -> Result<String> {
+    listener.set_nonblocking(true)?;
+    let deadline = Instant::now() + timeout;
     loop {
-        if std::time::Instant::now() > deadline {
-            bail!("timed out waiting for the browser sign-in");
-        }
-        let (mut stream, _) = listener.accept()?;
-        let mut line = String::new();
-        BufReader::new(&stream).read_line(&mut line)?;
+        let mut stream = accept_before(listener, deadline)?;
+        let line = read_request_line(&stream, deadline)?;
 
         // E.g. "GET /?state=...&code=... HTTP/1.1"
         let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
@@ -183,6 +187,38 @@ fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String>
     }
 }
 
+/// A blocking `accept()` would never notice the deadline when the browser never connects,
+/// so the listener is polled instead.
+fn accept_before(listener: &TcpListener, deadline: Instant) -> Result<TcpStream> {
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                // Accepted sockets inherit non-blocking mode on Windows.
+                stream.set_nonblocking(false)?;
+                // A browser may open a connection early and send the redirect on it later,
+                // so allow reads up to the deadline rather than a short fixed timeout.
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                stream.set_read_timeout(Some(remaining.max(Duration::from_millis(1))))?;
+                return Ok(stream);
+            }
+            Err(e) if e.kind() != ErrorKind::WouldBlock => {
+                return Err(e).context("accepting the sign-in redirect");
+            }
+            Err(_) if Instant::now() >= deadline => bail!(TIMEOUT_MESSAGE),
+            Err(_) => thread::sleep(ACCEPT_POLL),
+        }
+    }
+}
+
+fn read_request_line(stream: &TcpStream, deadline: Instant) -> Result<String> {
+    let mut line = String::new();
+    match BufReader::new(stream).read_line(&mut line) {
+        Ok(_) => Ok(line),
+        Err(_) if Instant::now() >= deadline => bail!(TIMEOUT_MESSAGE),
+        Err(e) => Err(e).context("reading the sign-in redirect"),
+    }
+}
+
 fn respond(stream: &mut impl Write, body: &str) -> std::io::Result<()> {
     let html = format!(
         "<!doctype html><meta charset=utf-8><body style='font-family:sans-serif;padding:2em'>{body}</body>"
@@ -204,4 +240,52 @@ pub fn access_token(app: &OAuthApp) -> Result<String> {
         .request(&http_client()?)
         .map_err(|e| anyhow!("refreshing Google token: {e:?}"))?;
     Ok(token.access_token().secret().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::mpsc;
+
+    use super::*;
+
+    /// Runs `wait_for_code` on a thread so a hang fails the test instead of blocking it.
+    fn wait_in_background(timeout: Duration) -> (u16, mpsc::Receiver<Result<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let _ = tx.send(wait_for_code(&listener, "abc", timeout));
+        });
+        (port, rx)
+    }
+
+    fn finished(rx: &mpsc::Receiver<Result<String>>) -> Result<String> {
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("wait_for_code did not return")
+    }
+
+    #[test]
+    fn returns_code_from_redirect() {
+        let (port, rx) = wait_in_background(Duration::from_secs(5));
+        let mut browser = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        browser
+            .write_all(b"GET /?state=abc&code=xyz HTTP/1.1\r\n\r\n")
+            .unwrap();
+        assert_eq!(finished(&rx).unwrap(), "xyz");
+    }
+
+    #[test]
+    fn gives_up_when_browser_never_connects() {
+        let (_port, rx) = wait_in_background(Duration::from_millis(200));
+        let err = finished(&rx).unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err:#}");
+    }
+
+    #[test]
+    fn gives_up_when_connection_sends_nothing() {
+        let (port, rx) = wait_in_background(Duration::from_millis(200));
+        let _silent = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        let err = finished(&rx).unwrap_err();
+        assert!(err.to_string().contains("timed out"), "{err:#}");
+    }
 }
