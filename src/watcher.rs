@@ -1,22 +1,22 @@
-/// Nomes de processo do osu!lazer (Windows e Linux).
+/// osu!lazer process names (Windows and Linux).
 const OSU_PROCESS_NAMES: &[&str] = &["osu!.exe", "osu!", "osu!lazer", "osu!lazer.exe"];
 
-/// Fase do acompanhamento do jogo.
+/// Game tracking phase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
-    /// Esperando o osu! abrir.
+    /// Waiting for osu! to open.
     Waiting,
-    /// osu! está aberto.
+    /// osu! is open.
     Playing,
 }
 
-/// Evento produzido por um poll.
+/// Event produced by a poll.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     None,
-    /// osu! foi detectado pela primeira vez.
+    /// osu! was detected for the first time.
     Started,
-    /// osu! fechou: hora de fazer o backup.
+    /// osu! closed: time to back up.
     Closed,
 }
 
@@ -26,7 +26,7 @@ pub fn is_osu_process(name: &str) -> bool {
         .any(|n| name.eq_ignore_ascii_case(n))
 }
 
-/// Função pura: dado o estado atual e se o osu! está rodando, devolve o novo estado e o evento.
+/// Pure function: given the current phase and whether osu! is running, returns the new phase and the event.
 pub fn step(phase: Phase, osu_running: bool) -> (Phase, Event) {
     match (phase, osu_running) {
         (Phase::Waiting, true) => (Phase::Playing, Event::Started),
@@ -35,7 +35,7 @@ pub fn step(phase: Phase, osu_running: bool) -> (Phase, Event) {
     }
 }
 
-/// Verifica no sistema se algum processo do osu! está ativo.
+/// Checks whether any osu! process is running.
 pub fn osu_is_running(sys: &mut sysinfo::System) -> bool {
     sys.refresh_processes_specifics(
         sysinfo::ProcessesToUpdate::All,

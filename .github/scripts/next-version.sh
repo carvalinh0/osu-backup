@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Calcula a próxima versão a partir dos commits desde a última tag vX.Y.Z.
+# Computes the next version from the commits since the last vX.Y.Z tag.
 #
-# Regras (Conventional Commits):
-#   BREAKING CHANGE no corpo ou "tipo!:" no assunto -> major
-#   "feat:" / "feat(escopo):"                         -> minor
-#   qualquer outro commit                              -> patch
+# Rules (Conventional Commits):
+#   BREAKING CHANGE in the body or "type!:" in the subject -> major
+#   "feat:" / "feat(scope):"                                -> minor
+#   any other commit                                        -> patch
 #
-# Sem nenhuma tag, usa a versão de Cargo.toml como primeira release.
-# Saída (key=value) vai para $GITHUB_OUTPUT quando definido, senão para stdout.
+# With no tag at all, the version in Cargo.toml is used as the first release.
+# Output (key=value) goes to $GITHUB_OUTPUT when set, otherwise to stdout.
 set -euo pipefail
 
 emit() {

@@ -4,20 +4,20 @@ use anyhow::{Context, Result};
 use md5::{Digest, Md5};
 use walkdir::WalkDir;
 
-/// Arquivo local que será enviado ao Drive.
+/// Local file to be uploaded to Drive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalFile {
-    /// Caminho relativo à pasta do osu!, com '/' como separador.
+    /// Path relative to the osu! folder, with '/' as the separator.
     pub rel: String,
     pub path: PathBuf,
 }
 
-/// Coleta somente os dados essenciais do osu!lazer:
-/// - client.realm (scores, beatmaps, coleções, configurações)
-/// - skins/ e exports/
-/// - arquivos .ini/.json da raiz
+/// Collects only the essential osu!lazer data:
+/// - client.realm (scores, beatmaps, collections, settings)
+/// - skins/ and exports/
+/// - root-level .ini/.json files
 ///
-/// Ignora `files/` (mapas e áudios, re-baixáveis), locks, logs e caches.
+/// Skips `files/` (beatmaps and audio, which can be re-downloaded), locks, logs and caches.
 pub fn collect_essential_files(osu_dir: &Path) -> Result<Vec<LocalFile>> {
     let mut out = Vec::new();
 
@@ -30,7 +30,7 @@ pub fn collect_essential_files(osu_dir: &Path) -> Result<Vec<LocalFile>> {
     }
 
     for entry in
-        std::fs::read_dir(osu_dir).with_context(|| format!("lendo {}", osu_dir.display()))?
+        std::fs::read_dir(osu_dir).with_context(|| format!("reading {}", osu_dir.display()))?
     {
         let entry = entry?;
         let path = entry.path();
@@ -70,8 +70,8 @@ pub fn collect_essential_files(osu_dir: &Path) -> Result<Vec<LocalFile>> {
     Ok(out)
 }
 
-/// Nome do arquivo no Drive. Como a pasta do Drive é plana, '%' e '/' são escapados
-/// de forma reversível para preservar a estrutura original.
+/// File name in Drive. The Drive folder is flat, so '%' and '/' are escaped
+/// reversibly to preserve the original structure.
 pub fn encode_drive_name(rel: &str) -> String {
     rel.replace('%', "%25").replace('/', "%2F")
 }
